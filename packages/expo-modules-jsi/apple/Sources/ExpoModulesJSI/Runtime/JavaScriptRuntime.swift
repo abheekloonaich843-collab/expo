@@ -37,7 +37,6 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   /// - are non-copyable. As value types, we would have to "borrow" them from React Native in an unsafe manner.
   internal let pointee: facebook.jsi.IRuntime
   internal let runtimePointee: facebook.jsi.Runtime
-  internal let scheduler: expo.RuntimeScheduler
 
   /// Strong handle that values hold instead of a `weak` reference to the runtime. See
   /// ``JavaScriptRuntimeHandle`` for why.
@@ -58,8 +57,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   internal init(_ runtime: facebook.jsi.Runtime) {
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.scheduler = expo.RuntimeScheduler.create()
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create())
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -71,8 +69,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let runtime = expo.createHermesRuntime()
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.scheduler = expo.RuntimeScheduler.create()
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create())
     self.ownsRuntime = true
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -85,8 +82,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let runtime = unsafeBitCast(unsafePointer, to: facebook.jsi.Runtime.self)
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.scheduler = expo.RuntimeScheduler.create()
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create())
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -119,8 +115,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let fn = unsafeBitCast(dispatch, to: expo.RuntimeScheduler.ScheduleFn.self)
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.scheduler = expo.RuntimeScheduler.create(scheduler, fn)
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create(scheduler, fn))
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -489,29 +484,24 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   /// Whether the runtime scheduler can dispatch work asynchronously to the JS thread.
   /// Returns false for standalone runtimes (e.g. in tests) where scheduled tasks run synchronously.
   public var supportsAsyncScheduling: Bool {
-    return scheduler.supportsAsyncScheduling()
+    return handle.supportsAsyncScheduling
   }
+
+  // The scheduling methods below forward to the runtime's handle, which has the only implementation.
 
   /// Schedules a closure to be executed with granted synchronized access to the runtime.
   public func schedule(
     priority: SchedulerPriority = .normal,
     @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () -> sending Void
   ) {
-    let cxxPriority = expo.RuntimeScheduler.Priority(rawValue: priority.rawValue) ?? .NormalPriority
-    scheduler.scheduleTask(cxxPriority) {
-      JavaScriptActor.assumeIsolated(closure)
-    }
+    handle.schedule(priority: priority, closure)
   }
 
   public func schedule(
     priority: SchedulerPriority = .normal,
     @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> Void
   ) {
-    schedule(priority: priority) {
-      Task.immediate_polyfill {
-        try await closure()
-      }
-    }
+    handle.schedule(priority: priority, closure)
   }
 
   /// Synchronously executes a closure on the JavaScript runtime thread, blocking the current thread until completion.
@@ -521,26 +511,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   public func execute<R: Sendable>(@_implicitSelfCapture _ closure: @escaping @JavaScriptActor () throws -> R) throws
     -> sending R
   {
-    if isOnJavaScriptThread() {
-      return try JavaScriptActor.assumeIsolated(closure)
-    }
-
-    var result: Result<R, any Error>!
-    let waiter = ThreadWaiter()
-
-    scheduler.scheduleTask(.ImmediatePriority) {
-      do {
-        result = .success(try JavaScriptActor.assumeIsolated(closure))
-      } catch {
-        result = .failure(error)
-      }
-      waiter.wake()
-    }
-
-    waiter.wait(until: {
-      result != nil
-    })
-    return try result.get()
+    return try handle.execute(closure)
   }
 
   /// Synchronously executes an async closure on the JavaScript runtime thread, blocking the current thread until completion.
@@ -550,30 +521,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   public func execute<R: Sendable>(
     @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> R
   ) throws -> sending R {
-    let result = NonisolatedUnsafeVar<Result<R, any Error>>()
-    let runInline = isOnJavaScriptThread()
-    let waiter = ThreadWaiter()
-
-    func body() {
-      Task.immediate_polyfill(priority: .high) {
-        do {
-          result.value = .success(try await closure())
-        } catch {
-          result.value = .failure(error)
-        }
-        waiter.wake()
-      }
-    }
-    if runInline {
-      body()
-    } else {
-      scheduler.scheduleTask(.ImmediatePriority, body)
-    }
-
-    waiter.wait(until: {
-      result.value != nil
-    })
-    return try result.value.get()
+    return try handle.execute(closure)
   }
 
   /// Asynchronously executes a sync closure on the JavaScript runtime thread, awaiting its completion without blocking.
@@ -581,18 +529,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   public func execute<R: Sendable>(
     @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () throws -> R
   ) async throws -> sending R {
-    if isOnJavaScriptThread() {
-      return try JavaScriptActor.assumeIsolated(closure)
-    }
-    return try await withUnsafeThrowingContinuation { continuation in
-      scheduler.scheduleTask(.ImmediatePriority) {
-        do {
-          continuation.resume(returning: try JavaScriptActor.assumeIsolated(closure))
-        } catch {
-          continuation.resume(throwing: error)
-        }
-      }
-    }
+    return try await handle.execute(closure)
   }
 
   /// Asynchronously executes an async closure on the JavaScript runtime thread, awaiting its completion without blocking.
@@ -600,20 +537,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   public func execute<R: Sendable>(
     @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> R
   ) async throws -> sending R {
-    if isOnJavaScriptThread() {
-      return try await Task.immediate_polyfill(priority: .high, operation: closure).value
-    }
-    return try await withUnsafeThrowingContinuation { continuation in
-      scheduler.scheduleTask(.ImmediatePriority) {
-        Task.immediate_polyfill(priority: .high) { @JavaScriptActor in
-          do {
-            continuation.resume(returning: try await closure())
-          } catch {
-            continuation.resume(throwing: error)
-          }
-        }
-      }
-    }
+    return try await handle.execute(closure)
   }
 
   /// Asynchronously executes an async closure that produces a `JavaScriptValue` on the JavaScript
@@ -639,11 +563,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     priority: SchedulerPriority = .normal,
     @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () -> Void
   ) {
-    if isOnJavaScriptThread() {
-      JavaScriptActor.assumeIsolated(closure)
-    } else {
-      schedule(priority: priority, closure)
-    }
+    handle.runOrSchedule(priority: priority, closure)
   }
 
   /// Checks whether the function is called on the JavaScript thread.
