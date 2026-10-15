@@ -89,6 +89,11 @@ internal final class JavaScriptRuntimeHandle: @unchecked Sendable {
   // of them) goes through these instead of holding the runtime. It never reads the runtime there: it
   // only schedules, and the scheduled work reads ``runtime`` on the JavaScript thread, where it can't
   // race the runtime's `deinit`. So the runtime needs no `weak` references.
+  //
+  // This holds only when the scheduler dispatches to the JavaScript thread (`supportsAsyncScheduling`).
+  // The scheduler of a runtime created without a host scheduler (a standalone runtime, or
+  // `AppContext.setRuntime` without one) runs the work right away on the calling thread, so there the
+  // work reads ``runtime`` on that thread, and the caller must not race the runtime's `deinit`.
 
   /// Whether the runtime may still be alive. Safe to call from any thread. `false` is final; `true` may
   /// already be stale off the JavaScript thread, so work scheduled after a `true` must check

@@ -103,6 +103,11 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   ///   `react::RuntimeScheduler` weakly (see `EXReactSchedulerDispatch.h` in
   ///   `ExpoModulesCore`), so dispatching after the React instance tore the
   ///   scheduler down safely drops the task.
+  ///
+  ///   `dispatch` can be called with this handle after the runtime is deallocated: promises and
+  ///   callbacks that outlive the runtime still schedule their release through it. So the handle must
+  ///   stay valid for as long as the process runs, and the host must drop tasks it can no longer run,
+  ///   as the React Native factory's handle does.
   /// - `dispatch`: raw pointer to a C function with signature
   ///   `void (*)(void *scheduler, int priority, void (^callback)())`.
   public init(
