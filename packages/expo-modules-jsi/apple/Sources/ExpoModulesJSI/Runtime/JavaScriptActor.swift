@@ -95,12 +95,10 @@ internal class JavaScriptExecutor: SerialExecutor, @unchecked Sendable {
 
 /// An actor that is dedicated for the specific runtime.
 internal actor JavaScriptRuntimeActor {
-  private weak let runtime: JavaScriptRuntime?
   nonisolated private let executor: JavaScriptExecutor
 
   init(runtime: JavaScriptRuntime) {
-    self.runtime = runtime
-    self.executor = JavaScriptRuntimeExecutor(runtime: runtime)
+    self.executor = JavaScriptRuntimeExecutor(runtimeHandle: runtime.handle)
   }
 
   nonisolated var unownedExecutor: UnownedSerialExecutor {
@@ -114,14 +112,17 @@ internal actor JavaScriptRuntimeActor {
 
 /// Serial executor dedicated for the specific runtime.
 internal final class JavaScriptRuntimeExecutor: JavaScriptExecutor, @unchecked Sendable {
-  private weak let runtime: JavaScriptRuntime?
+  private let runtimeHandle: JavaScriptRuntimeHandle
 
-  init(runtime: JavaScriptRuntime) {
-    self.runtime = runtime
+  init(runtimeHandle: JavaScriptRuntimeHandle) {
+    self.runtimeHandle = runtimeHandle
   }
 
   override func enqueue(_ job: UnownedJob) {
-    runtime?.schedule(priority: .immediate) {
+    guard runtimeHandle.mayBeAlive else {
+      return
+    }
+    runtimeHandle.schedule(priority: .immediate) { _ in
       job.runSynchronously(on: self.asUnownedSerialExecutor())
     }
   }

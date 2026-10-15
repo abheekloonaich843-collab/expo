@@ -49,15 +49,6 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   /// freed here, matching the immortal (no-op) release semantics of the imported reference type.
   private let ownsRuntime: Bool
 
-  /// Thread ID of the JavaScript thread, captured at construction time. Used by `isOnJavaScriptThread()`
-  /// for a fast integer comparison instead of `Thread.current.name == "..."`.
-  /// Assumes runtime initializers always run on the JS thread.
-  private let jsThreadID: UInt64 = {
-    var id: UInt64 = 0
-    pthread_threadid_np(nil, &id)
-    return id
-  }()
-
   /// Actor for running runtime work.
   lazy var runtimeActor: JavaScriptRuntimeActor = JavaScriptRuntimeActor(runtime: self)
 
@@ -67,8 +58,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   internal init(_ runtime: facebook.jsi.Runtime) {
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee)
     self.scheduler = expo.RuntimeScheduler.create()
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -80,8 +71,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let runtime = expo.createHermesRuntime()
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee)
     self.scheduler = expo.RuntimeScheduler.create()
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
     self.ownsRuntime = true
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -94,8 +85,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let runtime = unsafeBitCast(unsafePointer, to: facebook.jsi.Runtime.self)
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee)
     self.scheduler = expo.RuntimeScheduler.create()
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -123,8 +114,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let fn = unsafeBitCast(dispatch, to: expo.RuntimeScheduler.ScheduleFn.self)
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee)
     self.scheduler = expo.RuntimeScheduler.create(scheduler, fn)
+    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: self.scheduler)
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -653,9 +644,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   /// Checks whether the function is called on the JavaScript thread.
   @inline(__always)
   public final func isOnJavaScriptThread() -> Bool {
-    var current: UInt64 = 0
-    pthread_threadid_np(nil, &current)
-    return current == jsThreadID
+    return handle.isOnJavaScriptThread()
   }
 
   /// Whether the calling thread may use the runtime: its JavaScript thread, or any thread when the
@@ -851,7 +840,7 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
       // collection keeps it alive for the sweep; it does not retain the runtime.
       let longLivedObjects = self.longLivedObjects
       let nativeState = JavaScriptNativeState()
-      nativeState.setDeallocator { [weak self] nativeState in
+      nativeState.setDeallocator { [handle] nativeState in
         // Fires as the teardown object is released on the JavaScript thread with the runtime still
         // valid, so releasing JSI state here is safe. Mirrors the caveat on `AppContext.NativeState`:
         // a future cross-runtime path that could drop this state from another thread would have to
@@ -860,10 +849,10 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
           longLivedObjects.clear()
           // Also flush the cached `jsi::PropNameID`s and the cache: a non-owning wrapper can outlive its
           // runtime (e.g. captured by a task abandoned on reload) and would otherwise destroy them against
-          // the freed runtime when it deallocates. `self` is weak so the teardown object doesn't retain the
-          // wrapper; the owning wrapper clears both in `deinit`.
-          self?.propNameIdsRegistry.removeAll()
-          self?.cache.clear()
+          // the freed runtime when it deallocates. Reached through the handle so the teardown object doesn't
+          // retain the wrapper; the owning wrapper clears both in `deinit`.
+          handle.runtime?.propNameIdsRegistry.removeAll()
+          handle.runtime?.cache.clear()
         }
       }
       let object = createObject()
@@ -1023,7 +1012,7 @@ extension JavaScriptRuntime {
 }
 
 /// Blocks the thread that creates it in ``wait(until:)`` until another thread calls ``wake()``.
-private final class ThreadWaiter: @unchecked Sendable {
+internal final class ThreadWaiter: @unchecked Sendable {
   private enum Sleep {
     case runLoop(CFRunLoop, CFRunLoopSource, CFRunLoopMode)
     case semaphore(DispatchSemaphore)

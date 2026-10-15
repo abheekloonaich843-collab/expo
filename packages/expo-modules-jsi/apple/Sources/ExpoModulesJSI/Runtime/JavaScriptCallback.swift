@@ -34,7 +34,9 @@ public final class JavaScriptCallback: Sendable {
     }
   }
 
-  private weak let runtime: JavaScriptRuntime?
+  /// Handle to the runtime. The callback is called and dropped from any thread, so it is used only
+  /// through the handle's thread-safe API there (see ``JavaScriptRuntimeHandle``).
+  private let runtimeHandle: JavaScriptRuntimeHandle
   private let longLivedState: LongLivedState
 
   /// Wraps the function in `value`. Throws when the value isn't a function.
@@ -63,7 +65,7 @@ public final class JavaScriptCallback: Sendable {
 
   @JavaScriptActor
   private init(_ function: consuming JavaScriptValue, in runtime: borrowing JavaScriptRuntime) {
-    self.runtime = copy runtime
+    self.runtimeHandle = runtime.handle
     self.longLivedState = LongLivedState()
     longLivedState.function = function.getFunction()
     runtime.longLivedObjects.add(longLivedState)
@@ -71,13 +73,11 @@ public final class JavaScriptCallback: Sendable {
 
   deinit {
     // Without a runtime, the teardown sweep has already released the function.
-    guard let runtime else {
+    guard runtimeHandle.mayBeAlive else {
       return
     }
-    // Capture the collection, not the runtime, so the scheduled task doesn't keep the runtime alive.
-    let longLivedObjects = runtime.longLivedObjects
-    runtime.schedule { [longLivedState] in
-      longLivedObjects.remove(longLivedState)
+    runtimeHandle.schedule { [longLivedState] runtime in
+      runtime.longLivedObjects.remove(longLivedState)
       longLivedState.allowRelease()
     }
   }
@@ -197,11 +197,11 @@ public final class JavaScriptCallback: Sendable {
   /// Reports an error from a closure that can't throw it: to React Native's `ErrorUtils.reportError`,
   /// or to `console.error` without it, or prints it without a console.
   public func reportError(_ error: any Error) {
-    guard let runtime else {
+    guard runtimeHandle.mayBeAlive else {
       print("Error in a JavaScript callback: \(error)")
       return
     }
-    runtime.runOrSchedule {
+    runtimeHandle.runOrSchedule { runtime in
       self.report(error, in: runtime)
     }
   }
@@ -215,11 +215,11 @@ public final class JavaScriptCallback: Sendable {
   internal func runDetached(
     encodeArguments: @escaping @JavaScriptActor (JavaScriptRuntime) throws -> JavaScriptValuesBuffer
   ) {
-    guard let runtime else {
+    guard runtimeHandle.mayBeAlive else {
       print("Error in a JavaScript callback: \(RuntimeLostError())")
       return
     }
-    runtime.runOrSchedule {
+    runtimeHandle.runOrSchedule { runtime in
       do {
         _ = try self.call(encodeArguments, in: runtime)
       } catch {
@@ -233,8 +233,7 @@ public final class JavaScriptCallback: Sendable {
     encodeArguments: @escaping @JavaScriptActor (JavaScriptRuntime) throws -> JavaScriptValuesBuffer,
     decodeResult: @escaping @JavaScriptActor (borrowing JavaScriptValue, JavaScriptRuntime) throws -> R
   ) throws -> R {
-    let runtime = try liveRuntime()
-    return try runtime.execute {
+    return try runtimeHandle.execute { runtime in
       try decodeResult(try self.call(encodeArguments, in: runtime), runtime)
     }
   }
@@ -252,25 +251,20 @@ public final class JavaScriptCallback: Sendable {
       let promise: JavaScriptPromise = try promiseRef.take()
       // Wrapped in a ref, because the closure below escapes and can't capture a non-copyable value.
       let settled = try await promise.await().ref()
-      // The runtime is looked up again instead of being held across the await, which may never
-      // resume if the promise is pending when the runtime goes away. The await may also resume on
-      // another thread, so decode back on the JavaScript thread.
-      let runtime = try liveRuntime()
-      return try await runtime.execute {
+      // The await may resume on another thread, so decode back on the JavaScript thread.
+      return try await runtimeHandle.execute { runtime in
         let value: JavaScriptValue = try settled.take()
         return try decodeResult(value, runtime)
       }
     }
   }
 
-  /// Calls the function and decodes a result that isn't a promise. Holds the runtime only for the
-  /// duration of the call.
+  /// Calls the function and decodes a result that isn't a promise.
   private func callForAsync<R: Sendable>(
     encodeArguments: @escaping @JavaScriptActor (JavaScriptRuntime) throws -> JavaScriptValuesBuffer,
     decodeResult: @escaping @JavaScriptActor (borrowing JavaScriptValue, JavaScriptRuntime) throws -> R
   ) async throws -> UncheckedSendableBox<AsyncOutcome<R>> {
-    let runtime = try liveRuntime()
-    return try await runtime.execute { () throws -> UncheckedSendableBox<AsyncOutcome<R>> in
+    return try await runtimeHandle.execute { runtime throws -> UncheckedSendableBox<AsyncOutcome<R>> in
       let result = try self.call(encodeArguments, in: runtime)
       guard result.isThenable() else {
         return UncheckedSendableBox(.value(try decodeResult(result, runtime)))
@@ -282,13 +276,6 @@ public final class JavaScriptCallback: Sendable {
   private enum AsyncOutcome<R> {
     case value(R)
     case promise(JavaScriptPromise.Ref)
-  }
-
-  private func liveRuntime() throws -> JavaScriptRuntime {
-    guard let runtime else {
-      throw RuntimeLostError()
-    }
-    return runtime
   }
 
   /// Encodes the arguments and calls the function. Throws ``RuntimeLostError`` after the teardown
