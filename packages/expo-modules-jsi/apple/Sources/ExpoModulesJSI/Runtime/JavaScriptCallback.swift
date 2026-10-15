@@ -34,9 +34,9 @@ public final class JavaScriptCallback: Sendable {
     }
   }
 
-  /// Handle to the runtime. The callback is called and dropped from any thread, so it is used only
-  /// through the handle's thread-safe API there (see ``JavaScriptRuntimeHandle``).
-  private let runtimeHandle: JavaScriptRuntimeHandle
+  /// The runtime's scheduler, held instead of the runtime: the callback is called and dropped from any
+  /// thread, and the scheduler gives the work the runtime on the JavaScript thread.
+  private let scheduler: JavaScriptRuntime.Scheduler
   private let longLivedState: LongLivedState
 
   /// Wraps the function in `value`. Throws when the value isn't a function.
@@ -65,7 +65,7 @@ public final class JavaScriptCallback: Sendable {
 
   @JavaScriptActor
   private init(_ function: consuming JavaScriptValue, in runtime: borrowing JavaScriptRuntime) {
-    self.runtimeHandle = runtime.handle
+    self.scheduler = runtime.scheduler
     self.longLivedState = LongLivedState()
     longLivedState.function = function.getFunction()
     runtime.longLivedObjects.add(longLivedState)
@@ -73,10 +73,10 @@ public final class JavaScriptCallback: Sendable {
 
   deinit {
     // Without a runtime, the teardown sweep has already released the function.
-    guard runtimeHandle.mayBeAlive else {
+    guard scheduler.mayBeAlive else {
       return
     }
-    runtimeHandle.schedule { [longLivedState] runtime in
+    scheduler.schedule { [longLivedState] runtime in
       runtime.longLivedObjects.remove(longLivedState)
       longLivedState.allowRelease()
     }
@@ -197,11 +197,11 @@ public final class JavaScriptCallback: Sendable {
   /// Reports an error from a closure that can't throw it: to React Native's `ErrorUtils.reportError`,
   /// or to `console.error` without it, or prints it without a console.
   public func reportError(_ error: any Error) {
-    guard runtimeHandle.mayBeAlive else {
+    guard scheduler.mayBeAlive else {
       print("Error in a JavaScript callback: \(error)")
       return
     }
-    runtimeHandle.runOrSchedule { runtime in
+    scheduler.runOrSchedule { runtime in
       self.report(error, in: runtime)
     }
   }
@@ -215,11 +215,11 @@ public final class JavaScriptCallback: Sendable {
   internal func runDetached(
     encodeArguments: @escaping @JavaScriptActor (JavaScriptRuntime) throws -> JavaScriptValuesBuffer
   ) {
-    guard runtimeHandle.mayBeAlive else {
+    guard scheduler.mayBeAlive else {
       print("Error in a JavaScript callback: \(RuntimeLostError())")
       return
     }
-    runtimeHandle.runOrSchedule { runtime in
+    scheduler.runOrSchedule { runtime in
       do {
         _ = try self.call(encodeArguments, in: runtime)
       } catch {
@@ -233,7 +233,7 @@ public final class JavaScriptCallback: Sendable {
     encodeArguments: @escaping @JavaScriptActor (JavaScriptRuntime) throws -> JavaScriptValuesBuffer,
     decodeResult: @escaping @JavaScriptActor (borrowing JavaScriptValue, JavaScriptRuntime) throws -> R
   ) throws -> R {
-    return try runtimeHandle.execute { runtime in
+    return try scheduler.execute { runtime in
       try decodeResult(try self.call(encodeArguments, in: runtime), runtime)
     }
   }
@@ -252,7 +252,7 @@ public final class JavaScriptCallback: Sendable {
       // Wrapped in a ref, because the closure below escapes and can't capture a non-copyable value.
       let settled = try await promise.await().ref()
       // The await may resume on another thread, so decode back on the JavaScript thread.
-      return try await runtimeHandle.execute { runtime in
+      return try await scheduler.execute { runtime in
         let value: JavaScriptValue = try settled.take()
         return try decodeResult(value, runtime)
       }
@@ -264,7 +264,7 @@ public final class JavaScriptCallback: Sendable {
     encodeArguments: @escaping @JavaScriptActor (JavaScriptRuntime) throws -> JavaScriptValuesBuffer,
     decodeResult: @escaping @JavaScriptActor (borrowing JavaScriptValue, JavaScriptRuntime) throws -> R
   ) async throws -> UncheckedSendableBox<AsyncOutcome<R>> {
-    return try await runtimeHandle.execute { runtime throws -> UncheckedSendableBox<AsyncOutcome<R>> in
+    return try await scheduler.execute { runtime throws -> UncheckedSendableBox<AsyncOutcome<R>> in
       let result = try self.call(encodeArguments, in: runtime)
       guard result.isThenable() else {
         return UncheckedSendableBox(.value(try decodeResult(result, runtime)))

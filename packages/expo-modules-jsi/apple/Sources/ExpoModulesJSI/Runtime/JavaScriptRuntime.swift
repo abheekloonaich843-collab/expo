@@ -42,6 +42,9 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   /// ``JavaScriptRuntimeHandle`` for why.
   internal let handle: JavaScriptRuntimeHandle
 
+  /// Schedules work on the JavaScript thread. Promises and callbacks hold it instead of the runtime.
+  internal let scheduler: Scheduler
+
   /// Whether this wrapper owns the underlying `jsi::Runtime` and must destroy it on `deinit`. True
   /// only for the standalone `init()`, which creates the runtime via `createHermesRuntime()`. The
   /// other initializers adopt a runtime owned elsewhere (e.g. React Native), which must never be
@@ -57,7 +60,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   internal init(_ runtime: facebook.jsi.Runtime) {
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create())
+    self.handle = JavaScriptRuntimeHandle(self.pointee)
+    self.scheduler = Scheduler(expo.RuntimeScheduler.create(), handle: handle)
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -69,7 +73,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let runtime = expo.createHermesRuntime()
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create())
+    self.handle = JavaScriptRuntimeHandle(self.pointee)
+    self.scheduler = Scheduler(expo.RuntimeScheduler.create(), handle: handle)
     self.ownsRuntime = true
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -82,7 +87,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let runtime = unsafeBitCast(unsafePointer, to: facebook.jsi.Runtime.self)
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create())
+    self.handle = JavaScriptRuntimeHandle(self.pointee)
+    self.scheduler = Scheduler(expo.RuntimeScheduler.create(), handle: handle)
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
@@ -115,13 +121,15 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     let fn = unsafeBitCast(dispatch, to: expo.RuntimeScheduler.ScheduleFn.self)
     self.runtimePointee = runtime
     self.pointee = expo.iruntime(runtime)
-    self.handle = JavaScriptRuntimeHandle(self.pointee, scheduler: expo.RuntimeScheduler.create(scheduler, fn))
+    self.handle = JavaScriptRuntimeHandle(self.pointee)
+    self.scheduler = Scheduler(expo.RuntimeScheduler.create(scheduler, fn), handle: handle)
     self.ownsRuntime = false
     handle.attach(self)
     installLongLivedObjectsTeardown()
   }
 
   deinit {
+    scheduler.markRuntimeGone()
     handle.detach()
     // Destroy the runtime only if this wrapper created it (standalone `init()`); adopted runtimes
     // are owned elsewhere (e.g. React Native) and must not be freed here.
@@ -481,63 +489,74 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
 
   // MARK: - Runtime execution
 
+  // The scheduling methods forward to ``JavaScriptRuntime.Scheduler``, which has the only
+  // implementation. Each has an overload whose closure gets the runtime on the JavaScript thread, and
+  // one without a parameter. When the runtime is gone by then, `schedule` and `runOrSchedule` drop the
+  // work and `execute` throws ``JavaScriptCallback/RuntimeLostError``, so don't rely on them for work
+  // that must happen without the runtime, such as resuming a continuation.
+
   /// Whether the runtime scheduler can dispatch work asynchronously to the JS thread.
   /// Returns false for standalone runtimes (e.g. in tests) where scheduled tasks run synchronously.
   public var supportsAsyncScheduling: Bool {
-    return handle.supportsAsyncScheduling
+    return scheduler.supportsAsyncScheduling
   }
 
-  // The scheduling methods below forward to the runtime's handle, which has the only implementation.
-
-  /// Schedules a closure to be executed with granted synchronized access to the runtime.
+  /// Schedules a closure on the JavaScript thread and passes it the runtime. Drops the closure when
+  /// the runtime is gone by then.
   public func schedule(
     priority: SchedulerPriority = .normal,
-    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () -> sending Void
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) -> Void
   ) {
-    handle.schedule(priority: priority, closure)
+    scheduler.schedule(priority: priority, closure)
   }
 
+  /// Schedules an async closure on the JavaScript thread and passes it the runtime. Drops the closure
+  /// when the runtime is gone by then.
   public func schedule(
     priority: SchedulerPriority = .normal,
-    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> Void
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) async throws -> Void
   ) {
-    handle.schedule(priority: priority, closure)
+    scheduler.schedule(priority: priority, closure)
   }
 
   /// Synchronously executes a closure on the JavaScript runtime thread, blocking the current thread until completion.
-  /// Not available in async contexts to prevent blocking the cooperative thread pool.
+  /// Not available in async contexts to prevent blocking the cooperative thread pool. Throws
+  /// ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
   @available(*, noasync)
   @discardableResult
-  public func execute<R: Sendable>(@_implicitSelfCapture _ closure: @escaping @JavaScriptActor () throws -> R) throws
-    -> sending R
-  {
-    return try handle.execute(closure)
+  public func execute<R: Sendable>(
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) throws -> R
+  ) throws -> sending R {
+    return try scheduler.execute(closure)
   }
 
   /// Synchronously executes an async closure on the JavaScript runtime thread, blocking the current thread until completion.
-  /// Not available in async contexts to prevent blocking the cooperative thread pool.
+  /// Not available in async contexts to prevent blocking the cooperative thread pool. Throws
+  /// ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
   @available(*, noasync)
   @discardableResult
   public func execute<R: Sendable>(
-    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> R
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) async throws -> R
   ) throws -> sending R {
-    return try handle.execute(closure)
+    return try scheduler.execute(closure)
   }
 
   /// Asynchronously executes a sync closure on the JavaScript runtime thread, awaiting its completion without blocking.
+  /// Throws ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
   @discardableResult
   public func execute<R: Sendable>(
-    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () throws -> R
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) throws -> R
   ) async throws -> sending R {
-    return try await handle.execute(closure)
+    return try await scheduler.execute(closure)
   }
 
   /// Asynchronously executes an async closure on the JavaScript runtime thread, awaiting its completion without blocking.
+  /// Throws ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
   @discardableResult
   public func execute<R: Sendable>(
-    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> R
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) async throws -> R
   ) async throws -> sending R {
-    return try await handle.execute(closure)
+    return try await scheduler.execute(closure)
   }
 
   /// Asynchronously executes an async closure that produces a `JavaScriptValue` on the JavaScript
@@ -547,10 +566,11 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   @_disfavoredOverload
   @discardableResult
   public func execute(
-    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> JavaScriptValue
+    @_implicitSelfCapture _ closure:
+      @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) async throws -> JavaScriptValue
   ) async throws -> sending JavaScriptValue {
-    let ref = try await execute {
-      return try await closure().ref()
+    let ref = try await execute { (runtime: JavaScriptRuntime) in
+      return try await closure(runtime).ref()
     }
     // Moved out of the reference, not read with `asValue()`, which would clone the engine value
     // here, off the JavaScript thread.
@@ -558,18 +578,97 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
   }
 
   /// Runs a closure synchronously when already on the JavaScript thread, or schedules it
-  /// asynchronously otherwise. Unlike ``schedule(priority:_:)``, this can reenter the caller.
+  /// asynchronously otherwise, and passes it the runtime. Unlike ``schedule(priority:_:)``, this can
+  /// reenter the caller. Drops the closure when the runtime is gone.
+  public func runOrSchedule(
+    priority: SchedulerPriority = .normal,
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor (_ runtime: JavaScriptRuntime) -> Void
+  ) {
+    scheduler.runOrSchedule(priority: priority, closure)
+  }
+
+  /// Schedules a closure to be executed with granted synchronized access to the runtime. Drops the
+  /// closure when the runtime is gone by then.
+  public func schedule(
+    priority: SchedulerPriority = .normal,
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () -> sending Void
+  ) {
+    scheduler.schedule(priority: priority, closure)
+  }
+
+  /// Schedules an async closure on the JavaScript thread. Drops the closure when the runtime is gone by
+  /// then.
+  public func schedule(
+    priority: SchedulerPriority = .normal,
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> Void
+  ) {
+    scheduler.schedule(priority: priority, closure)
+  }
+
+  /// Synchronously executes a closure on the JavaScript runtime thread, blocking the current thread until completion.
+  /// Not available in async contexts to prevent blocking the cooperative thread pool. Throws
+  /// ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
+  @available(*, noasync)
+  @discardableResult
+  public func execute<R: Sendable>(@_implicitSelfCapture _ closure: @escaping @JavaScriptActor () throws -> R) throws
+    -> sending R
+  {
+    return try scheduler.execute(closure)
+  }
+
+  /// Synchronously executes an async closure on the JavaScript runtime thread, blocking the current thread until completion.
+  /// Not available in async contexts to prevent blocking the cooperative thread pool. Throws
+  /// ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
+  @available(*, noasync)
+  @discardableResult
+  public func execute<R: Sendable>(
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> R
+  ) throws -> sending R {
+    return try scheduler.execute(closure)
+  }
+
+  /// Asynchronously executes a sync closure on the JavaScript runtime thread, awaiting its completion without blocking.
+  /// Throws ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
+  @discardableResult
+  public func execute<R: Sendable>(
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () throws -> R
+  ) async throws -> sending R {
+    return try await scheduler.execute(closure)
+  }
+
+  /// Asynchronously executes an async closure on the JavaScript runtime thread, awaiting its completion without blocking.
+  /// Throws ``JavaScriptCallback/RuntimeLostError`` when the runtime is gone.
+  @discardableResult
+  public func execute<R: Sendable>(
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> R
+  ) async throws -> sending R {
+    return try await scheduler.execute(closure)
+  }
+
+  /// Asynchronously executes an async closure that produces a `JavaScriptValue` on the JavaScript
+  /// runtime thread. See the overload whose closure takes the runtime.
+  @_disfavoredOverload
+  @discardableResult
+  public func execute(
+    @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () async throws -> JavaScriptValue
+  ) async throws -> sending JavaScriptValue {
+    return try await execute { (_: JavaScriptRuntime) async throws -> JavaScriptValue in try await closure() }
+  }
+
+  /// Runs a closure synchronously when already on the JavaScript thread, or schedules it
+  /// asynchronously otherwise. Unlike ``schedule(priority:_:)``, this can reenter the caller. Drops
+  /// the closure when the runtime is gone.
   public func runOrSchedule(
     priority: SchedulerPriority = .normal,
     @_implicitSelfCapture _ closure: @escaping @JavaScriptActor () -> Void
   ) {
-    handle.runOrSchedule(priority: priority, closure)
+    scheduler.runOrSchedule(priority: priority, closure)
   }
 
   /// Checks whether the function is called on the JavaScript thread.
   @inline(__always)
   public final func isOnJavaScriptThread() -> Bool {
-    return handle.isOnJavaScriptThread()
+    return scheduler.isOnJavaScriptThread()
   }
 
   /// Whether the calling thread may use the runtime: its JavaScript thread, or any thread when the
@@ -634,8 +733,8 @@ open class JavaScriptRuntime: Equatable, Identifiable, @unchecked Sendable {
     // `@JavaScriptActor` runs this on the caller's thread, so go through `execute` to evaluate on the
     // JavaScript thread. It runs the closure in place when already there, or when the runtime has no
     // scheduler and thus no other thread to go to.
-    return try await execute { () async throws -> JavaScriptValue in
-      let value = try self.eval(label: label, source)
+    return try await execute { (runtime: JavaScriptRuntime) async throws -> JavaScriptValue in
+      let value = try runtime.eval(label: label, source)
       return value.is("Promise") ? try await value.getPromise().await() : value
     }
   }
